@@ -7,6 +7,7 @@
 //! See [`crate::Keyspace::scan_stats`].
 
 use lsm_tree::{UserKey, UserValue};
+use std::collections::HashMap;
 
 /// Number of buckets used by the fixed-size value-size histogram.
 ///
@@ -88,6 +89,214 @@ impl ScanStats {
             quantile_99: 0,
         }
     }
+}
+
+/// Fixed-bucket histogram of non-empty value sizes.
+///
+/// It runs in two phases:
+///
+/// 1. **Exact phase**: while at most [`HISTOGRAM_BUCKET_COUNT`] distinct
+///    sizes have been seen, every distinct size occupies its own slot, so
+///    quantiles are computed from the true multiset.
+/// 2. **Bucket phase**: once the distinct-size count would exceed the bucket
+///    count, an equal-width histogram spanning the observed min and max is
+///    built. If a later value falls outside the current span, the span is
+///    widened (the width is multiplied by a power of two) and every existing
+///    bucket is re-binned, keeping the bucket count constant.
+///
+/// The struct therefore never allocates beyond a fixed number of slots:
+/// memory has a hard upper bound independent of the number of observations.
+#[derive(Debug)]
+pub(crate) enum ValueSizeHistogram {
+    /// Exact phase: one counter per distinct observed size.
+    Exact(HashMap<u32, u64>),
+
+    /// Bucket phase: equal-width buckets `[min + i*width, min + (i+1)*width)`,
+    /// with the last bucket additionally covering the observed maximum.
+    ///
+    /// `min` and `max` are the actual smallest/largest observed sizes, so a
+    /// value escaping the current span can rebuild the histogram over the
+    /// true span without keeping any raw values.
+    Bucketed {
+        min: u32,
+        max: u32,
+        width: u64,
+        buckets: Box<[u64; HISTOGRAM_BUCKET_COUNT]>,
+    },
+}
+
+impl ValueSizeHistogram {
+    pub(crate) fn new() -> Self {
+        Self::Exact(HashMap::with_capacity(HISTOGRAM_BUCKET_COUNT))
+    }
+
+    /// Records one non-empty value size.
+    pub(crate) fn observe(&mut self, size: u32) {
+        debug_assert!(size > 0, "empty values must not enter the histogram");
+
+        match self {
+            Self::Exact(counts) => {
+                if let Some(count) = counts.get_mut(&size) {
+                    *count += 1;
+                    return;
+                }
+
+                if counts.len() < HISTOGRAM_BUCKET_COUNT {
+                    counts.insert(size, 1);
+                } else {
+                    // Promote to a fixed-width histogram over the observed span.
+                    let mut min = u32::MAX;
+                    let mut max = 0u32;
+                    for &seen in counts.keys() {
+                        min = min.min(seen);
+                        max = max.max(seen);
+                    }
+                    min = min.min(size);
+                    max = max.max(size);
+
+                    let width = bucket_width(min, max);
+                    let mut buckets = Box::new([0u64; HISTOGRAM_BUCKET_COUNT]);
+
+                    for (&seen, &count) in counts.iter() {
+                        buckets[bucket_index(seen, min, width)] += count;
+                    }
+                    buckets[bucket_index(size, min, width)] += 1;
+
+                    *self = Self::Bucketed {
+                        min,
+                        max,
+                        width,
+                        buckets,
+                    };
+                }
+            }
+
+            Self::Bucketed {
+                min,
+                max,
+                width,
+                buckets,
+            } => {
+                let escapes = size < *min || u64::from(size) >= upper_edge(*min, *width);
+
+                if escapes {
+                    // The value escapes the current span: rebuild equal-width
+                    // buckets over the true new span, re-binning existing
+                    // buckets by their lower boundary value.
+                    let old_min = *min;
+                    let old_width = *width;
+
+                    *min = (*min).min(size);
+                    *max = (*max).max(size);
+                    *width = bucket_width(*min, *max);
+
+                    let mut re_binned = [0u64; HISTOGRAM_BUCKET_COUNT];
+                    for (index, &count) in buckets.iter().enumerate() {
+                        if count == 0 {
+                            continue;
+                        }
+                        let boundary = u64::from(old_min) + old_width * index as u64;
+                        re_binned[bucket_index(boundary as u32, *min, *width)] += count;
+                    }
+                    **buckets = re_binned;
+                } else {
+                    *max = (*max).max(size);
+                }
+
+                buckets[bucket_index(size, *min, *width)] += 1;
+            }
+        }
+    }
+
+    /// Total number of recorded (non-empty) values.
+    pub(crate) fn total_count(&self) -> u64 {
+        match self {
+            Self::Exact(counts) => counts.values().sum(),
+            Self::Bucketed { buckets, .. } => buckets.iter().sum(),
+        }
+    }
+
+    /// Nearest-rank quantile using pure integer arithmetic.
+    ///
+    /// The quantile is `numerator / denominator` (e.g. `9 / 10` for p90) and
+    /// must lie in `(0, 1]`. The nearest rank is
+    /// `ceil(numerator * n / denominator)`, computed without floating point.
+    ///
+    /// Returns `None` when no values were recorded. In bucket phase, every
+    /// value in a bucket is represented by that bucket's lower boundary, per
+    /// the histogram contract.
+    pub(crate) fn nearest_rank_quantile(
+        &self,
+        numerator: u64,
+        denominator: u64,
+    ) -> Option<u32> {
+        debug_assert!(numerator > 0 && numerator <= denominator);
+
+        let total = self.total_count();
+        if total == 0 {
+            return None;
+        }
+
+        // ceil(numerator * total / denominator), 1-based rank.
+        let rank = (numerator * total + denominator - 1) / denominator;
+
+        match self {
+            Self::Exact(counts) => {
+                let mut sizes: Vec<u32> = counts.keys().copied().collect();
+                sizes.sort_unstable();
+
+                let mut cumulative = 0;
+                for size in sizes {
+                    cumulative += counts[&size];
+                    if cumulative >= rank {
+                        return Some(size);
+                    }
+                }
+                unreachable!("rank {rank} is within the total count {total}");
+            }
+
+            Self::Bucketed { min, width, buckets, .. } => {
+                let mut cumulative = 0;
+                for (index, &count) in buckets.iter().enumerate() {
+                    cumulative += count;
+                    if cumulative >= rank {
+                        let lower = u64::from(*min) + *width * index as u64;
+                        return Some(lower as u32);
+                    }
+                }
+                unreachable!("rank {rank} is within the total count {total}");
+            }
+        }
+    }
+}
+
+/// Equal bucket width for a span, guaranteeing the maximum lands in a valid
+/// bucket instead of being pushed past the last one.
+fn bucket_width(min: u32, max: u32) -> u64 {
+    debug_assert!(max >= min);
+
+    if max == min {
+        // All values share one size; any positive width keeps them in bucket 0.
+        return 1;
+    }
+
+    let span = u64::from(max) - u64::from(min);
+    span.div_ceil(HISTOGRAM_BUCKET_COUNT as u64).max(1)
+}
+
+/// The first value strictly beyond the histogram's current last bucket.
+fn upper_edge(min: u32, width: u64) -> u64 {
+    u64::from(min) + width * HISTOGRAM_BUCKET_COUNT as u64
+}
+
+/// Maps a value to its bucket index.
+///
+/// The last bucket additionally swallows any rounding remainder so the
+/// observed maximum is always covered.
+fn bucket_index(value: u32, min: u32, width: u64) -> usize {
+    let offset = u64::from(value) - u64::from(min);
+    let index = offset / width;
+    (index as usize).min(HISTOGRAM_BUCKET_COUNT - 1)
 }
 
 /// Accumulator fed one item at a time during the single scan pass.
@@ -224,5 +433,97 @@ mod tests {
         assert_eq!(stats.empty_value_count, 2);
         assert_eq!(&*stats.min_key, b"a");
         assert_eq!(&*stats.max_key, b"b");
+    }
+
+    #[test]
+    fn empty_histogram_has_no_quantiles() {
+        let hist = ValueSizeHistogram::new();
+        assert_eq!(hist.total_count(), 0);
+        assert_eq!(hist.nearest_rank_quantile(1, 2), None);
+    }
+
+    #[test]
+    fn exact_phase_quantiles_match_sorted_nearest_rank() {
+        let mut hist = ValueSizeHistogram::new();
+
+        // Well below the bucket count, every size gets its own slot.
+        for (size, count) in [(1u32, 5u64), (3, 2), (10, 4), (17, 1), (42, 3)] {
+            for _ in 0..count {
+                hist.observe(size);
+            }
+        }
+
+        assert_eq!(hist.total_count(), 15);
+        assert!(matches!(hist, ValueSizeHistogram::Exact(_)));
+
+        // Sorted multiset: 1x5, 3x2, 10x4, 17x1, 42x3
+        // p50 rank 8 -> 10; p90 rank 14 -> 42; p99 rank 15 -> 42
+        assert_eq!(hist.nearest_rank_quantile(50, 100), Some(10));
+        assert_eq!(hist.nearest_rank_quantile(90, 100), Some(42));
+        assert_eq!(hist.nearest_rank_quantile(99, 100), Some(42));
+        // p100 is always the maximum under nearest rank.
+        assert_eq!(hist.nearest_rank_quantile(1, 1), Some(42));
+    }
+
+    #[test]
+    fn promotion_keeps_bucket_count_fixed_and_total_preserved() {
+        let mut hist = ValueSizeHistogram::new();
+
+        // Distinct sizes exceed the bucket count, forcing bucket phase.
+        for size in 1..=(HISTOGRAM_BUCKET_COUNT as u32 + 50) {
+            hist.observe(size);
+        }
+
+        match &hist {
+            ValueSizeHistogram::Bucketed { buckets, .. } => {
+                assert_eq!(buckets.len(), HISTOGRAM_BUCKET_COUNT);
+            }
+            ValueSizeHistogram::Exact(_) => panic!("should have promoted to bucket phase"),
+        }
+        assert_eq!(
+            hist.total_count(),
+            (HISTOGRAM_BUCKET_COUNT as u64) + 50,
+            "no observations may be lost during promotion"
+        );
+    }
+
+    #[test]
+    fn escaping_value_rebuilds_buckets_without_losing_counts() {
+        let mut hist = ValueSizeHistogram::new();
+
+        for size in 100..=(100 + HISTOGRAM_BUCKET_COUNT as u32 + 10) {
+            hist.observe(size);
+        }
+        let total_before = hist.total_count();
+
+        // First escape far upward, then far downward.
+        hist.observe(10_000);
+        hist.observe(100_000);
+        hist.observe(1);
+
+        let (min, max) = match &hist {
+            ValueSizeHistogram::Bucketed { min, max, buckets, .. } => {
+                assert_eq!(buckets.len(), HISTOGRAM_BUCKET_COUNT);
+                (*min, *max)
+            }
+            ValueSizeHistogram::Exact(_) => panic!("should stay in bucket phase"),
+        };
+
+        assert_eq!(min, 1);
+        assert_eq!(max, 100_000);
+        assert_eq!(hist.total_count(), total_before + 3);
+    }
+
+    #[test]
+    fn constant_single_size_never_promotes_and_quantiles_are_exact() {
+        let mut hist = ValueSizeHistogram::new();
+        for _ in 0..100_000 {
+            hist.observe(7);
+        }
+
+        assert!(matches!(hist, ValueSizeHistogram::Exact(_)));
+        assert_eq!(hist.total_count(), 100_000);
+        assert_eq!(hist.nearest_rank_quantile(50, 100), Some(7));
+        assert_eq!(hist.nearest_rank_quantile(99, 100), Some(7));
     }
 }
