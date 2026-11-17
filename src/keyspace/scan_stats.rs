@@ -116,16 +116,41 @@ impl ScanStatsAccumulator {
     }
 
     /// Feeds a single key-value pair into the accumulator.
-    pub(crate) fn observe(&mut self, _key: &UserKey, _value: &UserValue) {
-        // Filled in during the next implementation step.
+    pub(crate) fn observe(&mut self, key: &UserKey, value: &UserValue) {
+        self.key_count += 1;
+        self.total_value_bytes += value.len() as u64;
+
+        if value.is_empty() {
+            self.empty_value_count += 1;
+        }
+
+        // The iterator yields keys in byte order, but track the endpoints
+        // explicitly so the contract does not rely on iterator ordering.
+        match &self.min_key {
+            Some(current) if current.as_ref() <= key.as_ref() => {}
+            _ => self.min_key = Some(key.clone()),
+        }
+        match &self.max_key {
+            Some(current) if current.as_ref() >= key.as_ref() => {}
+            _ => self.max_key = Some(key.clone()),
+        }
     }
 
     /// Produces the immutable [`ScanStats`] snapshot.
     pub(crate) fn finish(self) -> ScanStats {
-        // Skeleton: always return the all-zero result.
         let mut result = ScanStats::empty();
+
+        result.key_count = self.key_count;
+        result.total_value_bytes = self.total_value_bytes;
+        result.empty_value_count = self.empty_value_count;
         result.min_key = self.min_key.unwrap_or_else(UserKey::empty);
         result.max_key = self.max_key.unwrap_or_else(UserKey::empty);
+
+        // Integer mean, rounded down; an empty range stays at zero.
+        if self.key_count > 0 {
+            result.average_value_size = self.total_value_bytes / self.key_count;
+        }
+
         result
     }
 }
@@ -134,11 +159,70 @@ impl ScanStatsAccumulator {
 mod tests {
     use super::*;
 
+    fn key(bytes: &[u8]) -> UserKey {
+        UserKey::new(bytes)
+    }
+
+    fn value(bytes: &[u8]) -> UserValue {
+        UserValue::new(bytes)
+    }
+
     #[test]
     fn skeleton_empty_stats_are_all_zero() {
         let stats = ScanStatsAccumulator::new().finish();
         assert_eq!(stats, ScanStats::empty());
         assert!(stats.min_key.is_empty());
         assert!(stats.max_key.is_empty());
+    }
+
+    #[test]
+    fn counters_and_endpoints_are_tracked_in_one_pass() {
+        let mut acc = ScanStatsAccumulator::new();
+
+        // Deliberately out of order; endpoints must still be byte-ordered.
+        acc.observe(&key(b"m"), &value(b"hello"));
+        acc.observe(&key(b"a"), &value(b"xy"));
+        acc.observe(&key(b"z"), &value(b""));
+        acc.observe(&key(b"b"), &value(b"abc"));
+
+        let stats = acc.finish();
+
+        assert_eq!(stats.key_count, 4);
+        assert_eq!(stats.total_value_bytes, 10);
+        assert_eq!(stats.average_value_size, 2); // floor(10 / 4)
+        assert_eq!(stats.empty_value_count, 1);
+        assert_eq!(&*stats.min_key, b"a");
+        assert_eq!(&*stats.max_key, b"z");
+    }
+
+    #[test]
+    fn single_item_is_both_endpoints_and_mean_is_exact() {
+        let mut acc = ScanStatsAccumulator::new();
+        acc.observe(&key(b"only"), &value(b"seven77"));
+
+        let stats = acc.finish();
+
+        assert_eq!(stats.key_count, 1);
+        assert_eq!(stats.total_value_bytes, 7);
+        assert_eq!(stats.average_value_size, 7);
+        assert_eq!(stats.empty_value_count, 0);
+        assert_eq!(&*stats.min_key, b"only");
+        assert_eq!(&*stats.max_key, b"only");
+    }
+
+    #[test]
+    fn all_empty_values_count_but_contribute_no_bytes() {
+        let mut acc = ScanStatsAccumulator::new();
+        acc.observe(&key(b"a"), &value(b""));
+        acc.observe(&key(b"b"), &value(b""));
+
+        let stats = acc.finish();
+
+        assert_eq!(stats.key_count, 2);
+        assert_eq!(stats.total_value_bytes, 0);
+        assert_eq!(stats.average_value_size, 0);
+        assert_eq!(stats.empty_value_count, 2);
+        assert_eq!(&*stats.min_key, b"a");
+        assert_eq!(&*stats.max_key, b"b");
     }
 }
