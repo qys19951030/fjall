@@ -311,6 +311,9 @@ pub(crate) struct ScanStatsAccumulator {
     empty_value_count: u64,
     min_key: Option<UserKey>,
     max_key: Option<UserKey>,
+
+    /// Histogram of non-empty value sizes; empty values never enter it.
+    histogram: ValueSizeHistogram,
 }
 
 impl ScanStatsAccumulator {
@@ -321,6 +324,7 @@ impl ScanStatsAccumulator {
             empty_value_count: 0,
             min_key: None,
             max_key: None,
+            histogram: ValueSizeHistogram::new(),
         }
     }
 
@@ -331,6 +335,9 @@ impl ScanStatsAccumulator {
 
         if value.is_empty() {
             self.empty_value_count += 1;
+        } else {
+            // Value sizes are u32; empty values are excluded above.
+            self.histogram.observe(value.len() as u32);
         }
 
         // The iterator yields keys in byte order, but track the endpoints
@@ -358,6 +365,22 @@ impl ScanStatsAccumulator {
         // Integer mean, rounded down; an empty range stays at zero.
         if self.key_count > 0 {
             result.average_value_size = self.total_value_bytes / self.key_count;
+        }
+
+        // Quantiles only consider non-empty values. With no non-empty value
+        // the three fields stay zero.
+        if let Some(p50) = self.histogram.nearest_rank_quantile(50, 100) {
+            result.quantile_50 = u64::from(p50);
+            result.quantile_90 = u64::from(
+                self.histogram
+                    .nearest_rank_quantile(90, 100)
+                    .expect("p90 exists whenever any non-empty value exists"),
+            );
+            result.quantile_99 = u64::from(
+                self.histogram
+                    .nearest_rank_quantile(99, 100)
+                    .expect("p99 exists whenever any non-empty value exists"),
+            );
         }
 
         result
@@ -402,6 +425,12 @@ mod tests {
         assert_eq!(stats.empty_value_count, 1);
         assert_eq!(&*stats.min_key, b"a");
         assert_eq!(&*stats.max_key, b"z");
+
+        // Non-empty sizes sorted: 2, 3, 5
+        // p50 rank 2 -> 3, p90 rank 3 -> 5, p99 rank 3 -> 5
+        assert_eq!(stats.quantile_50, 3);
+        assert_eq!(stats.quantile_90, 5);
+        assert_eq!(stats.quantile_99, 5);
     }
 
     #[test]
@@ -433,6 +462,38 @@ mod tests {
         assert_eq!(stats.empty_value_count, 2);
         assert_eq!(&*stats.min_key, b"a");
         assert_eq!(&*stats.max_key, b"b");
+
+        // No non-empty values: quantiles stay zero.
+        assert_eq!(stats.quantile_50, 0);
+        assert_eq!(stats.quantile_90, 0);
+        assert_eq!(stats.quantile_99, 0);
+    }
+
+    #[test]
+    fn empty_values_are_excluded_from_quantiles() {
+        let mut acc = ScanStatsAccumulator::new();
+
+        // 90 empty values plus 10 values of size 4.
+        for i in 0..90 {
+            acc.observe(&key(format!("e{i}").as_bytes()), &value(b""));
+        }
+        for i in 0..10 {
+            acc.observe(
+                &key(format!("v{i}").as_bytes()),
+                &value(b"four"),
+            );
+        }
+
+        let stats = acc.finish();
+
+        assert_eq!(stats.key_count, 100);
+        assert_eq!(stats.empty_value_count, 90);
+        assert_eq!(stats.total_value_bytes, 40);
+        // Every non-empty value has size 4, so all quantiles are 4 even
+        // though 90% of all keys carry empty values.
+        assert_eq!(stats.quantile_50, 4);
+        assert_eq!(stats.quantile_90, 4);
+        assert_eq!(stats.quantile_99, 4);
     }
 
     #[test]

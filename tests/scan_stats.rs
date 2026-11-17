@@ -65,3 +65,38 @@ fn scan_stats_empty_range_returns_all_zero() -> fjall::Result<()> {
 
     Ok(())
 }
+
+/// Nearest-rank reference implementation over an explicit sorted multiset.
+fn nearest_rank(sorted: &[u32], numerator: u64, denominator: u64) -> u32 {
+    let n = sorted.len() as u64;
+    let rank = (numerator * n + denominator - 1) / denominator;
+    sorted[(rank - 1) as usize]
+}
+
+#[test]
+fn scan_stats_quantiles_are_exact_below_bucket_count() -> fjall::Result<()> {
+    let (_folder, db) = open_db()?;
+    let tree = db.keyspace("default", KeyspaceCreateOptions::default)?;
+
+    // Fewer distinct sizes than the (internal) fixed bucket count, so every
+    // size occupies its own slot and quantiles must be exact.
+    let sizes = [1u32, 1, 2, 2, 2, 3, 5, 8, 8, 13, 21, 21, 21, 34, 55];
+    for (i, size) in sizes.iter().enumerate() {
+        tree.insert(format!("k{i:04}"), vec![b'x'; *size as usize])?;
+    }
+
+    let stats = tree.scan_stats::<&[u8], _>(..)?;
+
+    let mut sorted = sizes;
+    sorted.sort_unstable();
+
+    assert_eq!(stats.quantile_50, u64::from(nearest_rank(&sorted, 50, 100)));
+    assert_eq!(stats.quantile_90, u64::from(nearest_rank(&sorted, 90, 100)));
+    assert_eq!(stats.quantile_99, u64::from(nearest_rank(&sorted, 99, 100)));
+
+    // Repeated scans over the same snapshot of data must be identical.
+    let stats_again = tree.scan_stats::<&[u8], _>(..)?;
+    assert_eq!(stats, stats_again);
+
+    Ok(())
+}
