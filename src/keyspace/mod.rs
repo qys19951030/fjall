@@ -5,8 +5,10 @@
 mod config;
 pub mod name;
 pub mod options;
-pub(crate) mod scan_stats;
+mod scan_stats;
 mod write_delay;
+
+pub use scan_stats::ScanStats;
 
 #[cfg(test)]
 mod test;
