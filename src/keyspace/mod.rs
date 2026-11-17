@@ -5,6 +5,7 @@
 mod config;
 pub mod name;
 pub mod options;
+pub(crate) mod scan_stats;
 mod write_delay;
 
 #[cfg(test)]
@@ -450,6 +451,45 @@ impl Keyspace {
         let nonce = self.supervisor.snapshot_tracker.open();
         let iter = self.tree.range(range, SeqNo::MAX, None);
         crate::iter::Iter::new(nonce, iter)
+    }
+
+    /// Computes statistics over a range of items in a single scan pass.
+    ///
+    /// The range has the same semantics as [`Keyspace::range`]: the lower
+    /// bound is inclusive and the upper bound is exclusive. An empty range
+    /// returns an all-zero [`ScanStats`](crate::ScanStats) whose endpoint
+    /// keys are empty.
+    ///
+    /// The scan is read-only: it never triggers flushing or compaction, and
+    /// does not modify the keyspace. Memory usage is bounded by a fixed-size
+    /// histogram regardless of how many items are scanned; scanned keys and
+    /// values are never collected.
+    ///
+    /// The counters (key count, total value bytes, average, empty values,
+    /// min/max key) are exact. The three quantiles (p50, p90, p99) are exact
+    /// while the number of distinct value sizes does not exceed the internal
+    /// histogram bucket count, and are estimated (within a bounded error)
+    /// afterwards. Empty values participate in the key count and byte total
+    /// but are excluded from quantile estimation.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs while scanning.
+    pub fn scan_stats<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+    ) -> crate::Result<scan_stats::ScanStats> {
+        let mut accumulator = scan_stats::ScanStatsAccumulator::new();
+
+        // Skeleton: the scan plumbing is in place, accumulation is filled in
+        // incrementally.
+        let iter = self.range(range);
+        for guard in iter {
+            let (key, value) = guard.into_inner()?;
+            accumulator.observe(&key, &value);
+        }
+
+        Ok(accumulator.finish())
     }
 
     /// Returns an iterator over a prefixed set of items.

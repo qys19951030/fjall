@@ -152,7 +152,7 @@ pub use {
     guard::Guard,
     iter::Iter,
     journal::{error::RecoveryError as JournalRecoveryError, writer::PersistMode},
-    keyspace::{options::CreateOptions as KeyspaceCreateOptions, Keyspace},
+    keyspace::{options::CreateOptions as KeyspaceCreateOptions, scan_stats::ScanStats, Keyspace},
     readable::Readable,
     snapshot::Snapshot,
     version::FormatVersion,
