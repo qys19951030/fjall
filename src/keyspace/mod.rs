@@ -483,8 +483,8 @@ impl Keyspace {
     ) -> crate::Result<scan_stats::ScanStats> {
         let mut accumulator = scan_stats::ScanStatsAccumulator::new();
 
-        // Skeleton: the scan plumbing is in place, accumulation is filled in
-        // incrementally.
+        // Reuse the range iterator's snapshot semantics; one pass, no
+        // buffering of scanned items.
         let iter = self.range(range);
         for guard in iter {
             let (key, value) = guard.into_inner()?;

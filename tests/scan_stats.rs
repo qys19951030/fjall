@@ -27,7 +27,7 @@ impl Rng {
 }
 
 #[test]
-fn scan_stats_skeleton_compiles() -> fjall::Result<()> {
+fn scan_stats_on_empty_keyspace_returns_zeroed() -> fjall::Result<()> {
     let (_folder, db) = open_db()?;
     let tree = db.keyspace("default", KeyspaceCreateOptions::default)?;
 
@@ -162,7 +162,7 @@ fn scan_stats_range_bounds_are_half_open() -> fjall::Result<()> {
     assert_eq!(stats.key_count, 3);
 
     // Unbounded lower side stops just before d.
-    let stats = tree.scan_stats(.. "d")?;
+    let stats = tree.scan_stats(.."d")?;
     assert_eq!(stats.key_count, 3);
 
     Ok(())
@@ -296,7 +296,11 @@ fn scan_stats_quantiles_accurate_on_100k_skewed() -> fjall::Result<()> {
     reference.sort_unstable();
 
     assert!(
-        reference.iter().collect::<std::collections::HashSet<_>>().len() > 1024,
+        reference
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1024,
         "workload must exceed the fixed bucket count to test estimation",
     );
 

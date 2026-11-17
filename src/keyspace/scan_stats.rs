@@ -102,9 +102,10 @@ impl ScanStats {
 ///    quantiles are computed from the true multiset.
 /// 2. **Bucket phase**: once the distinct-size count would exceed the bucket
 ///    count, an equal-width histogram spanning the observed min and max is
-///    built. If a later value falls outside the current span, the span is
-///    widened (the width is multiplied by a power of two) and every existing
-///    bucket is re-binned, keeping the bucket count constant.
+///    built. If a later value falls outside the current span, equal-width
+///    boundaries are rebuilt over the new true span and every existing
+///    bucket is re-binned by its lower boundary, keeping the bucket count
+///    constant.
 ///
 /// The struct therefore never allocates beyond a fixed number of slots:
 /// memory has a hard upper bound independent of the number of observations.
@@ -243,11 +244,7 @@ impl ValueSizeHistogram {
     /// Returns `None` when no values were recorded. In bucket phase, every
     /// value in a bucket is represented by that bucket's lower boundary, per
     /// the histogram contract.
-    pub fn nearest_rank_quantile(
-        &self,
-        numerator: u64,
-        denominator: u64,
-    ) -> Option<u32> {
+    pub fn nearest_rank_quantile(&self, numerator: u64, denominator: u64) -> Option<u32> {
         debug_assert!(numerator > 0 && numerator <= denominator);
 
         let total = self.total_count();
@@ -280,7 +277,12 @@ impl ValueSizeHistogram {
                 unreachable!("rank {rank} is within the total count {total}");
             }
 
-            Self::Bucketed { min, width, buckets, .. } => {
+            Self::Bucketed {
+                min,
+                width,
+                buckets,
+                ..
+            } => {
                 let mut cumulative = 0;
                 for (index, &count) in buckets.iter().enumerate() {
                     cumulative += count;
@@ -527,10 +529,7 @@ mod tests {
             acc.observe(&key(format!("e{i}").as_bytes()), &value(b""));
         }
         for i in 0..10 {
-            acc.observe(
-                &key(format!("v{i}").as_bytes()),
-                &value(b"four"),
-            );
+            acc.observe(&key(format!("v{i}").as_bytes()), &value(b"four"));
         }
 
         let stats = acc.finish();
@@ -656,7 +655,9 @@ mod tests {
         hist.observe(1);
 
         let (min, max) = match &hist {
-            ValueSizeHistogram::Bucketed { min, max, buckets, .. } => {
+            ValueSizeHistogram::Bucketed {
+                min, max, buckets, ..
+            } => {
                 assert_eq!(buckets.len(), HISTOGRAM_BUCKET_COUNT);
                 (*min, *max)
             }
@@ -692,7 +693,9 @@ mod tests {
         }
 
         let (min, max) = match &hist {
-            ValueSizeHistogram::Bucketed { buckets, min, max, .. } => {
+            ValueSizeHistogram::Bucketed {
+                buckets, min, max, ..
+            } => {
                 assert_eq!(buckets.len(), HISTOGRAM_BUCKET_COUNT);
                 (*min, *max)
             }
